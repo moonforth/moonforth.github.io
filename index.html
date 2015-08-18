@@ -1,1 +1,1721 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moonforth — Tinker with an interactive DCPU-16 Forth</title>
+<script src="moonforth-cpu.js"></script>
+<script src="moonforth-assembler.js"></script>
+<script src="moonforth-keyboard.js"></script>
+<script src="moonforth-LEM1802.js"></script>
+<script src="moonforth-coffee-script.js"></script>
+<script src="moonforth-jquery.js"></script>
+<link rel="stylesheet" href="style.css">
+<style>/*@import "grid.css";*/</style>
+<script type="text/coffeescript">
+$ ->
+  $("pre[id]").each (i, e) ->
+    $(e).attr "contenteditable", "true"
+  $("pre.assembly").each (i, e) ->
+    assembly = $ e
+    if assembly.hasClass "show"
+      runCode assembly
+    else
+      assembly.attr "contenteditable", "true"
+      p = $("<p></p>").insertAfter assembly
+      button = $("<button>Run Code</button>").click () ->
+        p.remove()
+        assembly.removeAttr "contenteditable"
+        runCode assembly
+      button.appendTo p
+
+runCode = (assembly) ->
+    div = assembly.wrap("<div></div>").parent()
+    dump = $("<pre></pre>").addClass("dump")
+    input = $("<input>").attr "size", "35"
+
+    text = assembly.text()
+    while text.indexOf(".INCLUDE _") > -1
+      text = text.replace /([.]INCLUDE (_[A-Z]+))/g, (_a, _b, label) ->
+        $("##{ label }").text()
+    word = ["0x0000"]
+    text = text.replace /([.]LINK ([A-Z0-9_]+))/g, (_a, _b, label) ->
+      replacement = ":#{ label }_TOP DAT #{ word }"
+      word[0] = "#{ label }_TOP"
+      replacement
+    breakpoints = []
+    text = text.replace /([.]BREAKPOINT ([A-Z0-9_]+))/g, (_a, _b, label) ->
+        breakpoints.push label.toLowerCase()
+        ""
+
+    cpu = new DCPU16.CPU()
+    assembler = new DCPU16.Assembler cpu
+    assembler.compile text
+    if breakpoints.length
+      assembler.setBreakpoints cpu, breakpoints
+    # This block is redundant:
+    if assembly.is "[data-breakpoints]"
+      breakpoints = assembly.attr("data-breakpoints").split " "
+      assembler.setBreakpoints cpu, breakpoints
+    keyboard = new Keyboard input[0]
+    cpu.addDevice keyboard
+
+    $("<button>Expand</button>").appendTo(div).click () ->
+      assembly.text text
+    $("<button>Labels</button>").appendTo(div).click () ->
+      cpu.showLabels = !cpu.showLabels
+      dump.text cpu.getDump()
+    $("<button>Step</button>").appendTo(div).click () ->
+      cpu.step()
+      dump.text cpu.getDump()
+    power = $("<button>Run</button>").appendTo(div).click () ->
+      if cpu.running
+        power.text "Run"
+        cpu.stop()
+      else
+        power.text "Stop"
+        cpu.run()
+    cpu.stopCallback = () ->
+      dump.text cpu.getDump()
+      power.text "Run"
+    $("<br></br>").appendTo div
+    input.appendTo div
+
+    if assembly.hasClass("output")
+        $("<br></br>").appendTo div
+        canvas = $("<canvas></canvas>").css border: "1px solid #333"
+        lem = new LEM1802 canvas[0]
+        cpu.addDevice lem
+        canvas.appendTo div
+
+    dump.appendTo(div).text cpu.getDump()
+</script>
+
 <h1>Moonforth</h1>
+
+<p class="logo"><img src="moonforth-logo.svg" width="72"></p>
+
+<p>This is a detailed <em>interactive</em> guide to building a <a href="https://en.wikipedia.org/wiki/Forth_%28programming_language%29">Forth</a> for an unusual architecture, the DCPU-16. Ever wanted to learn how the <a href="https://en.wikipedia.org/wiki/RTX2010">system</a> on the <a href="https://en.wikipedia.org/wiki/Philae_%28spacecraft%29">Philae comet lander</a> works, ported to an imaginary vintage computer used to control a spaceship in a futuristic game by the creator of <a href="https://en.wikipedia.org/wiki/Minecraft">Minecraft</a>? Then this is the guide for you!</p>
+
+<p>You can <a href="https://github.com/moonforth/moonforth.github.io">download this guide</a> and contribute.</p>
+
+<h2>Forth for the DCPU-16</h2>
+
+<h3>Why Forth?</h3>
+
+<p>Forth is an incredible language, and not very widely understood in the 21st century. It's seen as a bit of a dinosaur, or a relic from the golden age of computing when assembly was written by hand. Indeed it was initially developed for what are now vintage computers, but then so was C and so were other languages like Lisp—which is older than both Forth and C. The reason why Forth is now seldom used is allegedly because it is extremely low-level without having the performance advantages of C. But if you don't need high-level constructs like garbage collection, and you don't want to eke every last cycle of performance from your architecture, then perhaps you will be receptive to Forth's capabilities:</p>
+
+<blockquote>
+<p>what was most important was that nothing was hidden, there were no complex data structures around with “don't-look-at-this” parts (think on garbage collection in Lua, for example, and Lua's tables - beginners need to be convinced to see these things abstractly, as the concrete details of the implementation are hard), and everything - code, data, dictionaries, stacks - were just linear sequences of bytes, that could be read and modified directly if we wished to. We had total freedom, defining new words was quick, and experiments were quick to make; that gave us a sense of power that was totally different from, say, the one that a Python user feels today because he has huge libraries at his fingertips.</p>
+<p><cite><a href="http://angg.twu.net/miniforth-article.html">Eduardo Ochs</a></cite></p>
+</blockquote>
+
+<p>The key to Forth is that it gives you usable malleability at any level you like, including poking around in the very deep internals of your computer. As Ochs says, nothing is hidden in a Forth, and this means that you have the power to do things that are very difficult in other languages. The <a href="http://www.aaronsw.com/2002/toasterTinkers">freedom to tinker</a> is important.</p>
+
+<h3>Why the DCPU-16?</h3>
+
+<p>To learn Forth, it is a good idea to implement a Forth—to become a Forthwright—and learn how the language works under the covers. This necessarily means writing a Forth for a specific architecture. There are many architectures to choose from. You might pick the Z80 or 6502 for vintage charm, or the x64 for cutting edge performance. Instead, we pick the DCPU-16.</p>
+
+<p>The DCPU-16 was created by Markus "Notch" Persson in 2012 for the game <a href="https://en.wikipedia.org/wiki/0x10c">0x10c</a>. Notch, having been responsible for Minecraft (one of the best selling and most widely known computer games of all time), had a fanatical following when 0x10c was announced. Since 0x10c was to be a successor to Minecraft, and since it concentrated on vintage computing with a 16-bit CPU, programmers descended upon it in droves and wrote their own emulators, assemblers, even entire operating systems, for the architecture before the game was even released.</p>
+
+<p>The pressure that this put on Notch led him to give up working on the game. He didn't think that he could keep up with the fans. Though the specifications for the DCPU-16 were posted online, the game was abandoned, and later all of the official material for the architecture was taken offline. It's a shame, because 0x10c could have sparked a vintage computing renaissance, and it looked very fun to play. But the specifications are still available, hosted all over the web by the many fans, so the DCPU-16 can still be targeted.</p>
+
+<p>The DCPU-16 is the novelty choice. It means that a Forth written for it is not going to be taken too seriously, not run in earnest, not even run on a chip since there is no existing DCPU-16 in silicon. Because it was designed for a game, the DCPU-16 is also quite clear and simple and reasonable. This makes its assembly code easier to understand, at least for assembly. In other words, it's a great architecture for learning and having fun, and since Forth has these qualities too, the two should work together well. As the creator of Forth says:</p>
+
+<blockquote>
+<p>I encourage people to write their own Forth. The standard doesn't mean that you cannot invent something. [...] You can do three things with a computer. You can try to make money and that is unlikely. You can try to become famous and that never happens. And you can have fun and that always works.</p>
+<p><cite><a href="http://www.ultratechnology.com/color4th.html">Chuck Moore</a></cite></p>
+</blockquote>
+
+<p>Let's have fun with Forth.</p>
+
+<h2>How Forth works</h2>
+
+<p>Forth is a simple language. It is the synthesis of a few ideas:</p>
+
+<blockquote>
+<p>somewhere to store code and data (a dictionary), a way of passing information between bits of code (a stack), a way of invoking bits of code from other code (an evaluation function) and a way of knowing where to come back to when it's done (a return stack). A few primitive operations to read and write memory, and a few global variables so that code can find the stacks and dictionary, and that's it done.</p>
+<p><cite><a href="http://raspberryalphaomega.org.uk/2013/01/25/basics-of-a-forth-style-systen/">Frank Carver</a></cite></p>
+</blockquote>
+
+<p>The interface is just as simple. Words are read in a REPL, and either compiled or interpreted depending on the current REPL state. When a word is compiled, it's added to the dictionary—the mapping of words to their procedures. When a word is interpreted, then it is looked up in the dictionary and its procedure is entered. The stack is used to send parameters between procedures.</p>
+
+<p>The compilation of words into their dictionary forms is what gives Forth its flavour, more so than the stacks or postfix notation. These forms, the structure of the procedures in the dictionary, are called threaded code—not to be confused with the "multitasking" sense of threading which is most common in contemporary computing. A better word for it would be <em>woven</em> code. Compilation in Forth is the act of threading code into the dictionary. Here is a good explanation of Forth threads:</p>
+
+<blockquote>
+<p>They are a framework for talking about code compilation and meta-programming. [...] A compiled forth word is just a consecutive array of fixnums, most of which represent pointers to other words. This has always been one of the advantages of forth. Because of the transparency in the threading of the program into memory, forth allows fine control over many programming tradeoffs, including one of the most important: Execution speed versus program size. Threaded code lets us optimise our abstractions as close to our problems as possible, resulting in extremely fast, small programs. But just as lisp macros are about much more than just efficiency, so are forth threads. As much as lisp programmers, forth programmers tend to think of themselves as implementors instead of mere users. Forth and lisp are both about control—making your own rules.</p>
+<p><cite>Doug Hoyte, in Let Over Lambda pp.290–1</cite></p>
+</blockquote>
+
+<p>There are several ways to thread code, and each implementation must pick one. We're going to use indirect threaded code (ITC), which was classically the most popular way to write a Forth, and is the easiest to understand. To show how it works, we're going to need to explore the Forth VM.</p>
+
+<h3>The Forth VM</h3>
+
+<p>Forth is a way of interacting with a Von Neumann machine in a sensible way. And a Forth implementation is a fully reflective and introspectable glue layer between a Von Neumann CPU assembler and the Forth VM. Writing a Forth implementation means moulding the underlying architecture into something more tractable.</p>
+
+<p>The Forth VM consists of two main instruction registers, two registers that point to stacks, and what is sometimes described as an "inner interpreter" called NEXT that makes it all run. This inner interpreter is not really an interpreter, it's more like a return from a subroutine. In the assembly code implementation of the Forth VM, we'll return at the end of subroutines but we'll jump to NEXT at the end of sections of Forth VM code.</p>
+
+<p>To explain the Forth VM in more detail we'll need to look at a specific example. Here is a very simple Forth program:</p>
+
+<pre>
+: DOUBLE DUP ADD ;
+</pre>
+
+<p>This is a bit like the following in JavaScript syntax:</p>
+
+<pre>
+function double() {
+  dup();
+  add();
+}
+</pre>
+
+<p>We're defining a word called DOUBLE which calls the word DUP and then the word ADD in its definition. DUP duplicates the top item of the parameter stack, and then ADD adds the top two items together. So for example:</p>
+
+<pre>
+DUP [5] -> [5 5]
+ADD [5 5] -> [10]
+</pre>
+
+<p>But what the words actually do, which is the interesting part to the Forth user, is not relevant at the Forth VM level. At this level, we're interested in the actual memory structure of the threaded code, and the execution model.</p>
+
+<h3>Execution tokens</h3>
+
+<p>This is a simplified version of what threaded code looks like inside the computer for DOUBLE, DUP, and ADD in an ITC Forth like ours:</p>
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>DOUBLE</td><td>DOUBLE-XTO</td></tr>
+<tr><td></td><td>DUP</td></tr>
+<tr><td></td><td>ADD</td></tr>
+<tr><td></td><td>DOUBLE-TAIL</td></tr>
+<tr><td>DUP</td><td>DUP-XTO</td></tr>
+<tr><td>ADD</td><td>ADD-XTO</td></tr>
+<!--
+<tr><td></td><td></td></tr>
+-->
+</table>
+
+<p>This is just a representation of RAM, the memory of the computer. The value column is the consecutive sequence of integers that makes up the memory array. The key column are indices into that array, and computer people <a href="https://www.cs.utexas.edu/users/EWD/transcriptions/EWD08xx/EWD831.html">start counting at zero</a> not one. So DOUBLE might represent the number 0 (1st row), DUP the number 4 (5th row), and so on.</p>
+
+<p>DOUBLE is a Forth word, and it points to the value DOUBLE-XTO followed by DUP, ADD, and DOUBLE-TAIL. We call these four items the execution tokens (XTs) of DOUBLE. Similarly, DUP has a single XT called DUP-XTO, and ADD has the single XT called ADD-XTO. Note that the first XT of DOUBLE, DUP, and ADD all end with the suffix -XTO, which is short for XT ZERO. Traditionally this is called the Code Field Address or CFA, but we do not follow that tradition here.</p>
+
+<p>When DUP is being used as a value, as it is in the 2nd row, then we say this is an XT. But when it's being used as a key, as it is in the 5th row, we say this is the definition of the word DUP and it points to the DUP-XTO XT. Every Forth word is designed as a list of XTs like this.</p>
+
+<p>Here is a slightly more detailed look at the same thing:</p>
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>NEXT</td><td>WORD-FROM-CODE</td></tr>
+<tr><td></td><td>NEXT-WORD</td></tr>
+<tr><td></td><td>JUMP-XTO-VALUE</td></tr>
+<tr><td>DOUBLE</td><td>DOUBLE-XTO</td></tr>
+<tr><td></td><td>DUP</td></tr>
+<tr><td></td><td>ADD</td></tr>
+<tr><td></td><td>DOUBLE-TAIL</td></tr>
+<tr><td>DOUBLE-XTO</td><td>R-PUSH</td></tr>
+<tr><td></td><td>WORD-AFTER-XTO</td></tr>
+<tr><td></td><td>NEXT</td></tr>
+<tr><td>DOUBLE-TAIL</td><td>DOUBLE-TAIL-XTO</td></tr>
+<tr><td>DOUBLE-TAIL-XTO</td><td>R-POP</td></tr>
+<tr><td></td><td>NEXT</td></tr>
+<tr><td>DUP</td><td>DUP-XTO</td></tr>
+<tr><td>DUP-XTO</td><td>DUP-MACHINE-CODE</td></tr>
+<tr><td></td><td>NEXT</td></tr>
+<tr><td>ADD</td><td>ADD-XTO</td></tr>
+<tr><td>ADD-XTO</td><td>ADD-MACHINE-CODE</td></tr>
+<tr><td></td><td>NEXT</td></tr>
+<!-- <tr><td></td><td></td></tr> -->
+</table>
+
+<p>We've added what looks like a new word, NEXT, and we've also defined the -XTO and -TAIL XTs. Note how all of the -XTO and -TAIL XT sections end with NEXT as a value. NEXT is the only key here which is neither a word (DOUBLE, DUP, ADD) nor an execution token (DOUBLE-XTO, DOUBLE-TAIL, DUP-XTO, ADD-XTO). That's because NEXT is the core piece of VM machinery that allows us to return from these XTs into the next piece of code.</p>
+
+<p>The way that a CPU generally works is that it has a Program Counter (PC) register which is a key pointing to some value, and the value is a number which the CPU takes as machine code to execute. When it has been executed, the PC is usually incremented to the next number, so the adjacent cell—the next value below in the value column—is executed next, unless the machine code said to jump to another place. If you're familiar with assembly programming, this means that a jump is just a way to set the PC register.</p>
+
+<p>The two main registers in the Forth VM are the code register (CODE-R), and the word register (WORD-R). For historical reasons these registers are usually called IP and W respectively. CODE-R contains a key that points to the <em>next</em> word to be executed as its value. WORD-R contains a key that points to the XTO of the <em>current</em> word being executed as its value. So for example, CODE-R could be set to 4 which is the blank 5th key just underneath DOUBLE, which points to DUP. And WORD-R would be set to 3 which is the 4th key, DOUBLE, which points to DOUBLE-XTO.</p>
+
+<!--
+<p>(Note: When a value is also used somewhere as a key, we call it a pointer. If we had DOUBLE (3) in a register, we would refer to its value as *DOUBLE or [DOUBLE], which is DOUBLE-XTO (7). It's like doing RAM[DOUBLE]. Then we could use DOUBLE-XTO as a key, which we use the notation **DOUBLE or *DOUBLE-XTO or [DOUBLE-XTO] for, which is like RAM[RAM[DOUBLE]] or RAM[DOUBLE-XTO], and this gives us R-PUSH.)</p>
+-->
+
+<h3>How NEXT works</h3>
+
+<!--
+"Assembly language words usually end in a macro called "NEXT" which indexes the address interpreter to the next word, and executes it." — http://www.jupiter-ace.co.uk/whatisforth.html
+-->
+
+<p>Let's say we have the following Forth code:</p>
+
+<pre>
+5 DOUBLE DUP
+</pre>
+
+<p>This means to put 5 on the stack, giving us [5], double it giving us [10], and then duplicate it giving us [10 10]. We'll assume that we have already put 5 on the stack, and now we're going to call DOUBLE. We start with CODE-R set to a key which points to DOUBLE, because that's the next word that we want to execute. WORD-R can be set to anything to start with; it doesn't matter because we're about to use NEXT to set it for us. We call NEXT. If you look at the table above, you'll find that NEXT is defined as the sequence WORD-FROM-CODE, NEXT-WORD, and JUMP-INTO-XTO. Usually NEXT is implemented in assembly, and sometimes the assembly is so compact that it can be done in a single CPU instruction. But let's understand what is really going on here in the Forth VM independent of any specific CPU architecture implementation:</p>
+
+<ol>
+<li><strong>WORD-FROM-CODE</strong> uses CODE-R as a key to get a value that we store in WORD-R. So for example if CODE-R points to DOUBLE, then we set WORD-R to DOUBLE. DOUBLE itself points to DOUBLE-XTO. In C terminology, we're doing a pointer dereference on CODE-R, so it would look something like <code>word_r = *code_r</code>. In DCPU-16 assembly it looks like <code>SET WORD_R, [CODE_R]</code>.</li>
+<li><strong>NEXT-WORD</strong> increments CODE-R so that it points to the next word in our current code. Our input code is "5 DOUBLE DUP", and CODE-R currently points to DOUBLE. The next thing that it's going to point to is DUP, so we increment CODE-R to point to DUP. CODE-R is now the key that points to the value DUP.</li>
+<li><strong>JUMP-INTO-XTO</strong> uses CODE-R as a key to get a value that we jump to. At the moment CODE-R is set to DOUBLE. When we look up DOUBLE in memory, we find that it points to DOUBLE-XTO so we jump to DOUBLE-XTO.</li>
+</ol>
+
+<p>There are lots of different possible notations for expressing this. Here is one way of doing it:</p>
+
+<pre>
+WORD-R = GET(CODE-R)
+CODE-R = NEXT(CODE-R)
+JUMP(GET(WORD-R))
+</pre>
+
+<p>Here is another:</p>
+
+<pre>
+WORD-R <- [CODE-R++]
+PC <- [WORD-R]
+</pre>
+
+<p>And here is a gallery of explanations of ITC NEXT from around the web:</p>
+
+<table class="gallery">
+<tr>
+<td><pre>
+*ip++ -> w
+jump **w++
+</pre></td>
+<td><pre>
+[IP] TO W
+CELL +TO IP
+[W] JUMP
+</pre></td>
+<td><pre>
+W &lt;- [IP]
+IP &lt;- IP+1
+X &lt;- [W]
+JMP [X]
+</pre></td>
+<td><pre>
+(ip)+ -> w
+jmp (w)+
+</pre></td>
+</tr>
+<tr>
+<td><pre>
+lodsl
+jmp *(%eax)
+</pre></td>
+<td><pre>
+(IP) -> W
+IP+2 -> IP
+(W) ->  X
+JP (X)
+</pre></td>
+<td><pre>
+W &lt;= (IP++)
+PC &lt;= (W)
+</pre></td>
+<td><pre>
+w = *ip++;
+jmp *w;
+</pre></td>
+</tr>
+<tr>
+<td><pre>
+mov @ip+,w
+mov @w+,pc
+</pre></td>
+<td><pre>
+IP )+ W MOV W )+ ) JMP
+</pre></td>
+<td><pre>
+mov W, [IP]
+add IP, ONECELL
+jmp [W]
+</pre></td>
+<td><pre>
+cfa = *ip++;
+ca = *cfa;
+goto *ca;
+</pre></td>
+</tr>
+</table>
+
+<p>(Sources: 
+<a href="https://en.wikipedia.org/wiki/Threaded_code#Common_amenities">1</a>, 
+<a href="http://www.figuk.plus.com/build/heart.htm">2</a>, 
+<a href="http://amforth.sourceforge.net/TG/Architecture.html">3</a>, 
+<a href="http://www.factbook.org/wikipedia/en/f/fo/forth_virtual_machine.html">4</a>, 
+<a href="https://raw.githubusercontent.com/AlexandreAbreu/jonesforth/master/jonesforth.S">5</a>, 
+<a href="http://www.bradrodriguez.com/papers/moving1.htm">6</a>, 
+<a href="http://forum.6502.org/viewtopic.php?f=10&t=3046&start=15">7</a>, 
+<a href="https://groups.google.com/d/msg/comp.lang.forth/PpfY-snyKnY/AR-WxoEvBs0J">8</a>, 
+<a href="http://www.forth.org/svfig/kk/11-2014-Ting.pdf">9</a>, 
+<a href="http://www.colorforth.com/HOPL.html">10</a>, 
+<a href="http://computer-programming-forum.com/22-forth/cd130f11b29ec6ea.htm">11</a>, 
+<a href="https://lost-contact.mit.edu/afs/tu-bs.de/asis/hp_ux110/usr.local/doc/GNU.LANG/gforth-0.3.0/gforth_13.html">12</a>. Spot the odd ones out!)</p>
+
+<p>The notation doesn't really matter as long as you understand it. What we're doing in NEXT is setting WORD-R to point to the XTO of the next word, and then CODE-R to point to the word after next. You can think of it like two people skipping past one another: CODE-R was ahead, and then we set WORD-R to go past it, and then CODE-R goes past WORD-R. Then we go and do whatever WORD-R is pointing to, which will end with another call to NEXT so that we can do this over again. It's a bit like looping using tail recursion.</p>
+
+<h3>Primitive and regular words</h3>
+
+<p>There are two kinds of Forth word: primitive, and regular. In our example, DUP and ADD are primitive words, and DOUBLE is a regular word. Primitive words are quite straightforward:</p>
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>DUP</td><td>DUP-XTO</td></tr>
+<tr><td>DUP-XTO</td><td>DUP-MACHINE-CODE</td></tr>
+<tr><td></td><td>NEXT</td></tr>
+<!--
+<tr><td></td><td></td></tr>
+-->
+</table>
+
+<p>So a <em>primitive word</em> is one which only has one XT that points to some machine code followed by NEXT. The DUP-XTO value is actually the machine code implementation of DUP itself, and nothing else needs to be called. We finish with NEXT as usual. But things are a bit more complicated for regular words:</p>
+
+<table>
+<tr><th>Key</th><th>Value</th></tr>
+<tr><td>DOUBLE</td><td>DOUBLE-XTO</td></tr>
+<tr><td></td><td>DUP</td></tr>
+<tr><td></td><td>ADD</td></tr>
+<tr><td></td><td>DOUBLE-TAIL</td></tr>
+<tr><td>DOUBLE-XTO</td><td>R-PUSH</td></tr>
+<tr><td></td><td>WORD-AFTER-XTO</td></tr>
+<tr><td></td><td>NEXT</td></tr>
+<tr><td>DOUBLE-TAIL</td><td>DOUBLE-TAIL-XTO</td></tr>
+<tr><td>DOUBLE-TAIL-XTO</td><td>R-POP</td></tr>
+<tr><td></td><td>NEXT</td></tr>
+<!--
+<tr><td></td><td></td></tr>
+-->
+</table>
+
+<p>We find that a <em>normal word</em> is one which has a list of XTs starting with an XTO and then being followed by XTs which are words. Even DOUBLE-TAIL is a primitive word, with its own XTO. And instead of the XTO being an arbitrary block of machine code, it always has the contents R-PUSH, WORD-AFTER-XTO, and NEXT. These three bits of machine code are usually given the assembly label ENTER, or in old Forth DOCOL. ENTER is actually a pretty good name, but it does hide the implementation details at the VM level. What's happening here is as follows:</p>
+
+<ol>
+<li><strong>R-PUSH</strong> copies CODE-R and pushes it onto the return stack. We do this so that we know, at the end of executing the current word (DOUBLE in this case), where we're coming back to. In the "5 DOUBLE DUP" example, when we execute DOUBLE then CODE-R would be set to the DUP that comes afterwards, so that's where we'll come back to.</li>
+<li><strong>WORD-AFTER-XTO</strong> sets CODE-R to the value that comes after the current value of WORD-R. This means that CODE-R is moving from the outer layer of code, "5 DOUBLE DUP" to the insides of DOUBLE. Since WORD-R points to DOUBLE-XTO, CODE-R will now be pointing to the DUP value that is <em>inside</em> the definition of DOUBLE.</li>
+</ol>
+
+<p>To make this clear, imagine that the code that we're executing is in memory just before the definition of DOUBLE. We'll leave out the 5, so we're just putting "DOUBLE DUP" before the code, and we'll also add a word called QUIT so that the interpreter doesn't run into the code that follows. Here is where CODE-R starts before WORD-AFTER-XTO and where it is afterwards:</p>
+
+<table>
+<tr><th>Key</th><th>Value</th><th>Register</th></tr>
+<tr><td></td><td>DOUBLE</td><td></td></tr>
+<tr><td></td><td>DUP</td><td>CODE-R is here <em>before</em> WORD-AFTER-XTO</td></tr>
+<tr><td></td><td>QUIT</td><td></td></tr>
+<tr><td>DOUBLE</td><td>DOUBLE-XTO</td><td>WORD-R is here</td></tr>
+<tr><td></td><td>DUP</td><td>CODE-R moves to here <em>after</em> WORD-AFTER-XTO</td></tr>
+<tr><td></td><td>ADD</td><td></td></tr>
+<tr><td></td><td>DOUBLE-TAIL</td><td></td></tr>
+<tr><td>DOUBLE-XTO (ENTER)</td><td>R-PUSH</td><td></td></tr>
+<tr><td></td><td>WORD-AFTER-XTO</td><td></td></tr>
+<tr><td></td><td>NEXT</td><td></td></tr>
+<tr><td>DOUBLE-TAIL (EXIT)</td><td>DOUBLE-TAIL-XTO</td><td></td></tr>
+<tr><td>DOUBLE-TAIL-XTO</td><td>R-POP</td><td></td></tr>
+<tr><td></td><td>NEXT</td><td></td></tr>
+<!--
+<tr><td></td><td></td><td></td></tr>
+-->
+</table>
+
+<p>What's being done is that we're moving CODE-R to point inside the word that we're currently executing. WORD-AFTER-XTO moves CODE-R to point to the memory cell directly after the current WORD-R. This will always be a Forth word, but only in the body of regular Forth words. DOUBLE is a regular Forth word, so it has Forth words (DUP and ADD) inside it. This is why only the DOUBLE-XTO of regular Forth words needs to contain WORD-AFTER-XTO.</p>
+
+<p>The DUP and ADD inside the DOUBLE definition are then executed, and then we come to DOUBLE-TAIL. This is usually called EXIT, or in old Forth ;P. (;P may have been named by Chuck Moore, who favours extremely short and cryptic words in Forth.) Once again EXIT is quite a good name, but it hides the VM details. EXIT is the dual of ENTER, and it works as you might anticipate:</p>
+
+<ol>
+<li><strong>R-POP</strong> pops the value at the top of the return stack, and puts that value into CODE-R. In other words, we're going back to where CODE-R was originally before it entered this word. We have now done the opposite of the earlier R-PUSH, restoring the state of CODE-R to how it was immediately before the R-PUSH was called. Note that R-POP is the dual to both R-PUSH and WORD-AFTER-XTO combined, because the R-POP actually sets the value of CODE-R and reverses what WORD-AFTER-XTO and any subsequent calls did.</li>
+</ol>
+
+<p>Then we call NEXT, and the Forth VM continues with its normal business.</p>
+
+<h2>DCPU-16 assembler</h2>
+
+<p>We can implement NEXT, along with the ENTER and EXIT execution tokens, quite easily in just a handful of lines of DCPU-16 assembly. When we write code that we want to reuse, we'll put a capitalised bold module name in front of it that begins with an underscore, like <strong>_MODULE</strong>. Then later on we can refer to the code using this module name.</p>
+
+<p>In assembly, we use colon-prefixed words to temporarily label memory locations, a bit like the keys in the examples given above. The instructions that follow the labels are then compiled into machine code, and the address of that machine code is stored into the label. There are only a few DCPU-16 instructions, and we won't even be using all of them, so it's a good idea to <a href="https://github.com/FredrikL/DCPU16/blob/master/Spec/dcpu16_1_7.txt">read about them</a> and learn them to understand the code. It should be fairly self-explanatory anyway.</p>
+
+<p><strong>_NEXT</strong>:</p>
+
+<pre id="_NEXT">
+:NEXT
+:WORD_FROM_CODE
+  SET J, [I]   ; WORD-R <- *CODE-R
+:NEXT_WORD
+  ADD I, 0x01  ; CODE-R++
+:JUMP_INTO_XTO
+  SET PC, [J]  ; JUMP *WORD-R
+
+:ENTER
+:R_PUSH
+  SET [Z], I   ; *RET-R <- CODE-R (PUSH PART 1)
+  ADD Z, 0x01  ; RET-R++ (PUSH PART 2)
+:WORD_AFTER_XTO
+  SET I, J     ; CODE-R <- WORD-R
+  ADD I, 0x01  ; CODE-R++
+  SET PC, NEXT ; JUMP NEXT
+
+:EXIT
+  DAT EXIT_XTO
+:EXIT_XTO
+:R_POP
+  SUB Z, 0x01  ; RET-R-- (POP PART 1)
+  SET I, [Z]   ; CODE-R <- *RET-R (POP PART 2)
+  SET PC, NEXT ; JUMP NEXT
+</pre>
+
+<p>Now we can embed this code within a simple test program, and then actually run it directly in the browser! Any interactive code sample has a button below it called "Run Code". When you click that button, the interface will expand and a row of new buttons and some new text will appear beneath. The buttons control the DCPU-16 emulator and work as follows:<p>
+
+<ul>
+<li>Expand — does a macro expansion on the code.</li>
+<li>Labels — toggles showing memory labels next to the RAM dump.</li>
+<li>Step — processes the next instruction pointed to by the PC register, dumps the output, and stops.</li>
+<li>Run — just sets the CPU to go full steam ahead, running as many instructions as it can as fast as it can. This is not very fast by modern CPU standards, but it's extremely fast for interactive input, so expect to go through many tens of  thousands of CPU cycles per second. Changes to Stop, which enables you to stop the running CPU.</li>
+</ul>
+
+<p>Note that until you hit "Run Code", the modules and the code samples are editable within the browser. That means you can make your own modifications to experiment. When you hit Run Code, the current state is then frozen for that particular code sample.</p>
+
+<p>The assembler and emulator used here is a modified version of <a href="https://github.com/mappum/DCPU-16">Mappum DCPU-16</a> by Matt Bell. There are several modifications:</p>
+
+<ol>
+<li>The CPU and RAM dump now shows the current assembly label for the I, J, and PC registers. I is being used for CODE-R, and J is being used for WORD-R.</li>
+<li>The keyboard driver was broken, and is now fixed.</li>
+<li>There was no include facility, so an .INCLUDE macro is now added. All instances of the macro are expanded recursively in a preprocessing phase.</li>
+<li>A .LINK macro has been added, explained below.</li>
+<li>A .BREAKPOINT macro has been added, explained below.</li>
+<li>The ability to callback on a running CPU has been added.</li>
+</ol>
+
+<p>The .INCLUDE macro is especially useful as it allows us to embed modules previously defined with the bold capitalised labels starting with an underscore.</p>
+
+<p>Here is the first interactive test program, used to try _NEXT:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN ; JUMP MAIN
+
+.INCLUDE _NEXT
+
+:DOUBLE
+  DAT ENTER DUP ADD EXIT
+
+:DUP
+  DAT DUP_XTO
+:DUP_XTO
+  SET PUSH, PEEK ; STACK DUP
+  SET PC, NEXT   ; JUMP NEXT
+
+:ADD
+  DAT ADD_XTO
+:ADD_XTO
+  SET X, POP   ; STACK POP
+  ADD PEEK, X  ; ADD X to top of stack
+  SET PC, NEXT ; JUMP NEXT
+
+:LOOP
+  DAT LOOP_XTO
+:LOOP_XTO
+  SET PC LOOP_XTO
+
+:CODE_1 DAT DOUBLE
+:CODE_2 DAT DUP
+:CODE_3 DAT LOOP
+
+:MAIN
+  SET I, CODE_1  ; CODE-R <- CODE_1
+  SET PUSH, 0x05 ; STACK PUSH 0x05
+  SET PC, NEXT   ; JUMP NEXT
+</pre>
+
+<p>We start by jumping immediately to MAIN. This sets up CODE-R (the I register) by setting it to CODE_1, the first line of our input code, which is the array [DOUBLE, DUP, LOOP]. We use the DCPU-16's SP, the built in stack, for the Forth VM's data stack, so SP is DATA-R. It grows down from the top of memory, using 0xFFFF as the top of the stack to begin with. We push 0x05 to the stack, and SP goes down to 0xFFFE. For the Forth VM's return stack RET-R we use the DCPU-16's Z register arbitrarily, leaving A, B, C, X, and Y as general registers. This stack will grow upwards in memory. We then start the Forth VM's execution by calling NEXT.</p>
+
+<p>Then execution proceeds in the manner described in the Forth VM introduction above. DOUBLE is stored in WORD-R, and CODE-R is incremented to CODE_2. We jump to the XTO of DOUBLE, which is ENTER, and do R_PUSH. This places a value on the return stack. WORD_AFTER_XTO is called, and WORD-R is set to point to the DUP inside of DOUBLE. NEXT is called again, and WORD-R moves along to DUP. This is executed, changing the stack from [5] to [5 5]. We then call ADD and the stack changes to [10]. Note that in memory, the old 5 value at the end of the stack is still left there, but is no longer accessible. When ADD is finished we call EXIT, and that puts CODE_2 back into WORD-R. The example is effectively done at this point, but see if you can guess what happens next. Then try it out using the Step button.</p>
+
+<h2>Referring to words</h2>
+
+<p>This is all fine and dandy, but there is one problem. We can only refer to words by their memory locations, using assembler labels. In Forth, we want to be able to refer to them not by memory locations, but by ASCII names. To do this, we need to construct a Forth dictionary. Our words will be contained within the Forth dictionary.</p>
+
+<p>A Forth dictionary is quite simple. It consists of a <a href="https://en.wikipedia.org/wiki/Linked_list">linked list</a> of pointers to the previous word, which are followed by arbitrary length data which we have to parse in order to move through. The data consists of the following fields:</p>
+
+<ol>
+<li>One machine word of metadata. The metadata is 0bXXXXXXABCCCCCCCC where X is unused, A is a smudge flag bit, B is an immediate flag bit, and CCCCCCCC is the length of the word name. This means we can store Forth word names up to 256 characters long.</li>
+<li>The bytes of the word name, packed into machine words. The word DOUBLE for example consists of the six bytes 44 4F 55 42 4C 45. Which we pack into 0x444F 0x5542 0x4C45. We may also need to pad with 0x00 to reach a word boundary.</li>
+<li>The actual execution tokens for the word, which we're already familiar with.</li>
+</ol>
+
+<p>The pointer in the first word is just set to 0x0000. So imagine that DOUBLE were the first word. We would store the header like so:</p>
+
+<pre>
+:DOUBLE
+  DAT 0x0000 0x0006 ; Previous word, and flags and length
+  DAT 0x444F 0x5542 0x4C45 ; "DO" "UB" "LE"
+; DAT ENTER DUP ADD EXIT
+
+======= RAM: =======
+0000: 0000 0006 444f 5542 4c45 0000 0000 0000
+</pre>
+
+<p>We have to pack it ourselves because look what happens when we try to use DAT "DOUBLE" instead:</p>
+
+<pre>
+:DOUBLE
+  DAT 0x0000 0x0006 ; Previous word, and flags and length
+  DAT "DOUBLE" ; Not quite as nicely packed
+; DAT ENTER DUP ADD EXIT
+
+======= RAM: =======
+0000: 0000 0006 0044 004f 0055 0042 004c 0045
+</pre>
+
+<h3>Linking words</h3>
+
+<p>The Mappum DCPU-16 assembler is quite primitive with no built-in macro constructs. As well as adding .INCLUDE, there is another addition called .LINK which helps us to create word headers more easily. Any appearance of ".LINK LABEL" is expanded to ":LABEL_TOP DAT PREVIOUS_TOP" where PREVIOUS_TOP is either the previously seen label, or 0x0000 if we're doing the first .LINK expansion. It would also be helpful to generate packed name representation, for example turning DOUBLE into "DAT 0x444F 0x5542 0x4C45". We delegate this responsibility to a small Python 3 script called <code>link</code> which generates such code for us:</p>
+
+<pre>
+#!/usr/bin/env python3
+
+import sys
+
+def main(word=None):
+    word = sys.argv[1].upper() if (word is None) else word
+    size = len(word)
+    print(".LINK %s 0x%04X ; Header with flags and length" % (word, size))
+    print("  DAT ", end="")
+    if size % 2:
+        word += "\x00"
+    pairs = [word[i:i+2] for i in range(0, size, 2)]
+    for pair in pairs:
+        print("0x%02X%02X " % (ord(pair[0]), ord(pair[1])), end="")
+    print("; " + " ".join('"%s"' % repr(pair)[1:-1] for pair in pairs))
+    print(":%s" % word)
+
+if __name__ == "__main__":
+    main()
+</pre>
+
+<p>You just give it the name of the word you're defining:</p>
+
+<pre>
+$ python3 link DUP
+.LINK DUP 0x0003 ; Header with flags and length
+  DAT 0x4455 0x5000 ; "DU" "P\x00"
+:DUP
+</pre>
+
+<p>Now we can use this script to create a dictionary:</p>
+
+<p><strong>_DDA</strong>:</p>
+
+<pre id="_DDA">
+.LINK DOUBLE 0x0006 ; Header with flags and length
+  DAT 0x444F 0x5542 0x4C45 ; "DO" "UB" "LE"
+:DOUBLE
+  DAT ENTER DUP ADD EXIT
+
+.LINK DUP 0x0003 ; Header with flags and length
+  DAT 0x4455 0x5000 ; "DU" "P\x00"
+:DUP
+  DAT DUP_XTO
+:DUP_XTO
+  SET PUSH, PEEK ; STACK DUP
+  SET PC, NEXT   ; JUMP NEXT
+
+.LINK ADD 0x0003 ; Header with flags and length
+  DAT 0x4144 0x4400 ; "AD" "D\x00"
+:ADD
+  DAT ADD_XTO
+:ADD_XTO
+  SET X, POP   ; STACK POP
+  ADD PEEK, X  ; ADD X to top of stack
+  SET PC, NEXT ; JUMP NEXT
+</pre>
+
+<p>We also need to store a pointer in a standard place, e.g. on a register or a global variable in memory, to the top or latest entry into the dictionary. We can put that just after the dictionary, and if we do so, then we can helpfully use the .LINK macro again to expand it for us. We call it DICTIONARY, which .LINK will expand for us to DICTIONARY_TOP. We'll also want a standard memory location for the dictionary to grow into. This is a pointer, and we'll start it out at 0xD1C8:</p>
+
+<p><strong>_DICT</strong>:</p>
+
+<pre id="_DICT">
+.LINK DICTIONARY
+:DICTIONARY_FREE DAT 0xD1C8
+</pre>
+
+<p>We need to make sure that we always include _DICT after any other word definitions, otherwise DICTIONARY_TOP won't be set to the correct value.</p>
+
+<p>All together that looks like this in RAM:</p>
+
+<pre class="assembly">
+:LOOP SET PC, LOOP
+:ENTER :EXIT :NEXT DAT 0x00 ; Some makeshift entries
+
+.INCLUDE _DDA
+.INCLUDE _DICT
+</pre>
+
+<p>There's no point running this code since it just loops. But you can do two things. First, press Expand and see what the macro expander makes of the source code. Then, look at the structure of the memory. Can you see where each of the words is compiled to in machine code? It's quite easy to spot the packed names, but it's more difficult to tell apart the flags and length words from the pointers to other words. This is the difficulty when debugging assembly; numbers can mean a range of things, and it's difficult to distinguish between kinds of data. If you press Labels, it will show you roughly where each of the items are stored.</p>
+
+<p>This is a lot like the previous data we had, but now we added dictionary headers.</p>
+
+<h3>Finding entries</h3>
+
+<p>You can think of the Forth dictionary as a slow associative array. Now we want to be able to get entries from it. The basic process is that we start with the top of the dictionary, the value of DICTIONARY_TOP. Then we read the length from this entry, and see if it matches the length of the word that we're trying to find. If it does, then we check the packed name to see if it matches the packed name of the input. If it doesn't, or if that fails, we move to the next dictionary entry unless it's the 0x0000 pointer at the end. If the name matches, then we return a pointer to this entry, and to this entry's XTO.</p>
+
+<p><strong>_FIND</strong>:</p>
+
+<pre id="_FIND">
+:FIND_INPUT_WORD DAT 0x0000
+:FIND_INPUT_LENGTH DAT 0x0000
+:FIND_CURRENT_ENTRY DAT 0x0000
+
+:FIND_SUB
+  ; Input: X = Pointer to word to find, Y = Length of word to find
+  ; Output: X = Pointer of found word or 0x0000, Y = Pointer to the XTO
+
+:FIND_SETUP
+  ; Move the input registers to memory, so that we can reuse them
+  SET [FIND_INPUT_WORD], X
+  SET [FIND_INPUT_LENGTH], Y
+  ; FIND_CURRENT_ENTRY is the candidate that we're testing
+  ; We start out with the most recent entry, DICTIONARY_TOP 
+  SET [FIND_CURRENT_ENTRY], [DICTIONARY_TOP]
+
+:FIND_TEST_LENGTH
+  ; Now we set X as a local copy of this candidate
+  ; We have this temporary copy to do some pointer arithmetic
+  SET X, [FIND_CURRENT_ENTRY]
+  ; Here's the pointer arithmetic
+  ; We add one to get the flags and length field
+  ADD X, 0x01
+  ; Mask out the immediate flag, but leave the smudge flag in
+  SET Y, [X]    ; 0bXXXXXXABCCCCCCCC A = Smudge, B = Immediate
+  AND Y, 0xFEFF ; 0b1111111011111111 Immediate flag to 0
+  ; This executes the next line if we have the wrong length
+  ; If we have the right length, it skips the next line
+  IFN [FIND_INPUT_LENGTH], Y
+    SET PC, FIND_WRONG ; JUMP FIND_WRONG
+  SET PC, FIND_RIGHT_LENGTH ; JUMP FIND_RIGHT_LENGTH
+
+:FIND_WRONG
+  ; The word did not match, so we need to get the next pointer
+  ; Now we can store that pointer as our new candidate
+  ; But only if the pointer is not 0x0000
+  ; If the pointer is 0x0000 then we fail
+  IFE [FIND_CURRENT_ENTRY], 0x0000
+    SET PC, FIND_FAILURE ; JUMP FIND_FAILURE
+  SET X, [FIND_CURRENT_ENTRY]
+  SET [FIND_CURRENT_ENTRY], [X]
+  SET PC, FIND_TEST_LENGTH ; JUMP FIND_TEST_LENGTH
+
+:FIND_RIGHT_LENGTH
+  ; We set a word counter, which is half of the length to find
+  ; That's because machine words are 16-bits long
+  ; The length is in 8-bit words (bytes), so we need half that value
+  ; We also need to round up because there may be a pad byte
+  ; We use Y for the word counter
+  SET Y, [FIND_INPUT_LENGTH]
+  DIV Y, 2
+  ; Check for remainder
+  IFN EX, 0x0000
+    ; If there was a remainder, add one
+    ADD Y, 1
+  ; Now we compare each machine word (character pair) in a loop
+
+:FIND_RIGHT_LENGTH_LOOP
+  ; We compare the words from the end to the start
+  ; Get the current machine word we want to find
+  SET A, [FIND_INPUT_WORD]
+  ADD A, Y
+  ; This is a raw zero-based array, so we're one over
+  SUB A, 1 ; Fudge factor
+  SET A, [A]
+  ; Get the current machine word candidate
+  SET B, [FIND_CURRENT_ENTRY]
+  ADD B, Y
+  ; This has two header fields (pointer, length), so we're one under
+  ADD B, 1 ; Inverse fudge factor
+  SET B, [B]
+  ; Compare them
+  IFN A, B
+    SET PC, FIND_WRONG
+  SUB Y, 1
+  ; Check whether we ran out of machine words to compare
+  IFE Y, 0
+    ; We ran out of machine words to compare
+    ; Exit this loop, noting success in finding the word
+    SET PC, FIND_SUCCESS ; JUMP FIND_SUCCESS
+  ; Otherwise, we loop again
+  SET PC, FIND_RIGHT_LENGTH_LOOP ; JUMP FIND_RIGHT_LENGTH_LOOP
+
+:FIND_SUCCESS
+  ; We found something
+  SET X, [FIND_CURRENT_ENTRY]
+  ADD Y, [FIND_INPUT_LENGTH]
+  DIV Y, 2
+  IFN EX, 0x0000
+    ADD Y, 1
+  ADD Y, [FIND_CURRENT_ENTRY]
+  ADD Y, 2
+  ; Return from subroutine
+  SET PC, POP
+
+:FIND_FAILURE
+  ; We didn't find anything
+  SET X, 0x0000
+  ; Return from subroutine
+  SET PC, POP
+</pre>
+
+<p>Here's a test program:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+
+.INCLUDE _NEXT
+.INCLUDE _DDA
+.INCLUDE _FIND
+.INCLUDE _DICT
+
+:WORD_DATA DAT 0x444F 0x5542 0x4C45 ; "DO" "UB" "LE"
+:LENGTH_DATA DAT 0x06
+
+:MAIN SET X, WORD_DATA
+      SET Y, [LENGTH_DATA]
+      JSR FIND_SUB
+:DONE SET PC, DONE ; Loop
+</pre>
+
+<p>If you step through this program, eventually the pointer to DOUBLE should appear in the X register. If you want to do this quickly, press Run, wait a few milliseconds, then press Stop and Labels. Check the value of X, and look that up in RAM. The value of that word should be 0x0000, and the label "double_top" should appear in the list of labels to the side of that row. FIND also returns the XTO in Y, which should be 5 more than the address it stored in Y (one for the header, one for DO, one for UB, one for LE, and another to get to the XTO).</p>
+
+<h2>Reading input</h2>
+
+<p>Forth is an interactive system, so we want to be able to read from an input device. There is a generic keyboard device for the DCPU-16 with the device ID 0x30CF7406. The DCPU-16 needs to know the device ID because it uses it when setting up and receiving interrupts. We need to write a simple driver for this device. We'll set up an interrupt handler that pushes characters into a circular FIFO stack called INPUT_STACK. We can make this stack any size we like, and it's bounded by INPUT_STACK_BOUNDARY.</p>
+
+<p>A circular FIFO stack means that if the stack size is exceeded, then the old characters will be overwritten. Usually this would be a problem, as it means that text which has been input may go missing. But it is important on the DCPU-16, because according to its specification the CPU malfunctions when there is too much input: "If the queue grows longer than 256 interrupts, the DCPU-16 will catch fire." This behaviour is, moreover, enforced by the emulator.</p>
+
+<p><strong>_KEYBOARD</strong>:</p>
+
+<pre id="_KEYBOARD">
+:INPUT_STACK_START DAT INPUT_STACK
+:INPUT_STACK_END DAT INPUT_STACK
+
+:INPUT_PUSH_SUB
+  ; This is used by HANDLE_INTERRUPT
+  ; Expects a character on C, and pushes it to the INPUT_STACK
+  ; Let's get the "top" of the INPUT_STACK
+  SET X, [INPUT_STACK_END]
+  ; Store C into the top of the INPUT_STACK
+  SET [X], C
+  ; Move the stack on, ready for the next character to be added
+  ADD [INPUT_STACK_END], 0x01
+  ; If we moved into the boundary, we need to rotate to the front
+  IFE [INPUT_STACK_END], INPUT_STACK_BOUNDARY
+    SET [INPUT_STACK_END], INPUT_STACK
+  ; Return from subroutine
+  SET PC, POP
+
+:INPUT_POP_SUB
+  ; This can be called by anybody, to get the next character from input
+  ; It puts that character into X
+  ; It is the caller's responsibility to check the stack size!
+  ; I.e. use IFN [INPUT_STACK_START], [INPUT_STACK_END]
+  ; The stack will appear empty after a full revolution
+  ; (We could increment _START when _END meets the boundary)
+  ; Get the current start point
+  SET Y, [INPUT_STACK_START]
+  ; Get the value at the current start point into X
+  SET X, [Y]
+  ; Move the start point onwards, consuming a character
+  ADD [INPUT_STACK_START], 0x01
+  ; Check whether we moved into the boundary
+  IFE [INPUT_STACK_START], INPUT_STACK_BOUNDARY
+    ; If we moved into the boundary, we need to rotate to the front
+    SET [INPUT_STACK_START], INPUT_STACK
+  ; Return from subroutine
+  SET PC, POP
+
+; Device ID of the keyboard
+:KEYBOARD DAT 0x30CF 0x7406
+
+; Temporary storage to backup registers
+:INTERRUPT_BACKUP_A DAT 0x0000
+:INTERRUPT_BACKUP_C DAT 0x0000
+
+:HANDLE_INTERRUPT
+  ; We enter this subroutine asynchronously!
+  ; That means we might clobber the A and C registers by mistake
+  ; To avoid that, let's backup those registers
+  SET [INTERRUPT_BACKUP_A], A
+  SET [INTERRUPT_BACKUP_C], C
+:HANDLE_INTERRUPT_START
+  ; Set the interrupt mode to "put the character in C"
+  SET A, 0x01
+  ; Get the actual character and put it into C, if there is one
+  HWI [KEYBOARD]
+  ; Check to see whether we did get a character
+  IFE C, 0x00
+    ; If we didn't get a character, we can just return
+    ; RFI probably stands for "Return From Interrupt"
+    ; The argument to RFI is just a dummy argument which is discarded
+    RFI 0
+  ; Push the character from C into the circular FIFO input stack
+  JSR INPUT_PUSH_SUB
+  ; Restore the registers A and C as they were
+  SET A, [INTERRUPT_BACKUP_A]
+  SET C, [INTERRUPT_BACKUP_C]
+:HANDLE_INTERRUPT_FINISH
+  ; And now we can return
+  RFI 0
+
+:CONNECT_KEYBOARD_SUB
+  ; Register our interrupt handler
+  IAS HANDLE_INTERRUPT
+  ; Subscribe to the keyboard interrupts
+  SET A, 0x03
+  SET B, 0x01
+  HWI [KEYBOARD]
+  ; Now any interrupts will be handled by HANDLE_INTERRUPT
+  ; Return from subroutine
+  SET PC, POP
+</pre>
+
+<p>Here's another small test program:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+
+; Pad so that the INPUT_STACK starts at 0008
+; That makes it easier to debug in the RAM dump
+:PADDING DAT 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF
+
+:INPUT_STACK DAT 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+:INPUT_STACK_BOUNDARY DAT 0x00
+
+.INCLUDE _KEYBOARD
+
+:MAIN JSR CONNECT_KEYBOARD_SUB
+:LOOP SET PC, LOOP
+</pre>
+
+<p>To test this code, keep pressing Step until PC reads "loop". Then type a few input characters such as "abc" into the input box. Then keep pressing step and observe how 0061 0062 0063 are entered into the INPUT_STACK.</p>
+
+<p>Note that you can edit a code section to add a .BREAKPOINT macro before you press Run Code. A breakpoint is an instruction to the debugger, in this case contained within the CPU emulator (which was added to Mappum's code), to stop running when it reaches a particular address in PC. Try setting ".BREAKPOINT LOOP" to this example and then pressing Run. It will stop when it reaches the loop and update the CPU and RAM dump. Then you can type in some characters, and hit Run again. It will read one character before hitting the breakpoint again. Hit Run again and it will get the next character, and so on.</p>
+
+<p>Now we can create a simple subroutine called KEY_SUB that takes a character from standard input and pushes it to the data stack:</p>
+
+<p><strong>_KEY</strong>:</p>
+
+<pre id="_KEY">
+:KEY_SUB
+  ; Waits for a character and pushes it onto X
+  ; Factored out because it's useful to call
+  ; If we don't have a character yet...
+  IFE [INPUT_STACK_START], [INPUT_STACK_END]
+    ; Then we loop until we get one
+    SET PC, KEY_SUB
+  ; We're out of the loop so we must have a character now
+  ; We get the character and place it into X using INPUT_POP_SUB
+  JSR INPUT_POP_SUB
+  ; Return from subroutine
+  SET PC, POP
+</pre>
+
+<p>We'll be using this subroutine to help us parse user input. At some point we'll also want to upgrade this subroutine to do something else. If we wanted to create a Forth word wrapper for this subroutine, we could do something like this:</p>
+
+<pre>
+.LINK KEY 0x0003 ; Header with flags and length
+  DAT 0x4B45 0x5900 ; "KE" "Y\x00"
+:KEY
+  DAT KEY_XTO
+:KEY_XTO
+  ; Wait for a character and then push it onto X
+  JSR KEY_SUB
+  ; Now we push the character onto the data stack
+  SET PUSH, X
+  ; And return using the Forth inner interpreter
+  SET PC, NEXT
+</pre>
+
+<p>We can also bundle these up into a single combined input driver with a large INPUT_STACK:</p>
+
+<p><strong>_INPUT</strong>:</p>
+
+<pre id="_INPUT">
+:INPUT_STACK ; 256 machine words, 256 characters
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+:INPUT_STACK_BOUNDARY
+  DAT 0x00
+
+.INCLUDE _KEYBOARD
+</pre>
+
+<p>We don't include _KEY because we'll want to upgrade it.</p>
+
+<h2>Parsing user input</h2>
+
+<p>Now we can write a word called WORD that scans for the next word from the input. Note that Chuck Moore, Forth's inventor, doesn't like WORD. He prefers not to emphasise the internals of Forth when exposing it to users, and a word called WORD is, he thinks, a bit confusing: "If you want an extension wordset with all the internal necessary to write your own interpreter fine, but not the CORE wordset." (<a href="http://www.ultratechnology.com/cm52299.htm">Source</a>) (He also doesn't like string processing very much.) In any case, we're going to implement it here because the main reason for this Forth is to show how the insides work!</p>
+
+<p><strong>_WORDBUF</strong>:</p>
+
+<pre id="_WORDBUF">
+:WORD_LENGTH
+  DAT 0x00
+:WORD_POSITION
+  DAT WORD_BUFFER
+  DAT 0xE07D ; Padding
+:WORD_BUFFER ; 256 machine words, 256 characters
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+:WORD_BUFFER_BOUNDARY
+  DAT 0x00
+</pre>
+
+<p><strong>_WORD</strong>:</p>
+
+<pre id="_WORD">
+.INCLUDE _WORDBUF
+
+:WORD_SUB
+  ; Reset the state, because we might have been called before
+  SET [WORD_POSITION], WORD_BUFFER
+  SET [WORD_LENGTH], 0x00
+:WORD_SUB_LOOP
+  ; Wait for a character and put it into X
+  JSR KEY_SUB
+  ; If it's space...
+  IFE X, 0x20 ; 0x20 is ASCII for " " SPACE
+    ; Then we're at the end of the word, so return from subroutine
+:WORD_SUB_END
+    SET PC, POP
+:WORD_SUB_ADD
+  ; Otherwise, add to our word buffer
+  SET Y, [WORD_POSITION]
+  SET [Y], X
+  ADD [WORD_POSITION], 1
+  ADD [WORD_LENGTH], 1
+  ; Did we reach the maximum word length?
+  IFE [WORD_POSITION], [WORD_BUFFER_BOUNDARY]
+    ; If so, return from subroutine anyway
+    ; The caller should check whether they hit the maximum length
+    SET PC, POP
+  ; Otherwise, we just loop
+  SET PC, WORD_SUB_LOOP
+</pre>
+
+<p>And let's test it:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+
+:INPUT_STACK ; 32 machine words, 32 characters
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+:INPUT_STACK_BOUNDARY DAT 0x00
+
+; Padding to align the WORD_BUFFER to 0068
+DAT 0xFFFF 0xFFFF 0xFFFF 0xFFFF 0xFFFF
+
+.INCLUDE _KEYBOARD
+.INCLUDE _KEY
+.INCLUDE _WORD
+
+:MAIN JSR CONNECT_KEYBOARD_SUB
+      JSR WORD_SUB
+:LOOP SET PC, LOOP
+</pre>
+
+<p>If you entered the text "ABC " (don't forget the trailing space), you should see lines like these in the RAM dump if you turned on labels:</p>
+
+<pre>
+0000:*7f81*0180 0041 0042 0043 0020 0000 0000 start input_stack
+...
+0068: 0041 0042 0043 0000 0000 0000 0000 0000 word_buffer
+</pre>
+
+<p>The INPUT_STACK has 0x0020, the space, in it but WORD_BUFFER does not.</p>
+
+<h2>Creating words</h2>
+
+<p>In Forth, the user can also create words programmatically. What happens is, user input is treated in one of two modes, either interpret or compile. The user input state is called FORTH_MODE, and it's set to 0 for interpret, and 1 for compile. Most of the time we're in interpret mode, but if we want to create a word then we have to go into compile mode.</p>
+
+<p>You create new words in Forth like this:</p>
+
+<pre>
+: DOUBLE DUP ADD ;
+</pre>
+
+<p>The colon (":") sets FORTH_MODE to compile. Now we read DOUBLE and create the following data in RAM:</p>
+
+<pre>
+.LINK DOUBLE 0x0006 ; Header with flags and length
+  DAT 0x444F 0x5542 0x4C45 ; "DO" "UB" "LE"
+:DOUBLE
+  DAT ENTER
+</pre>
+
+<p>Note that we haven't added DUP ADD EXIT yet. When we read DUP and ADD, that's when we add those. Reading the semicolon (";") adds EXIT and sets FORTH_MODE back to interpret. This means that we have to do the equivalent of the .LINK macro in our assembly itself. We already know the pointer to the previous word since it's stored in DICTIONARY_TOP. We also need to know where to start creating this new word in the first place, so we'll name the next piece of available memory for the dictionary DICTIONARY_FREE. When we read characters from the user, each character goes into a single machine word, so one of the main things we need to do here is pack each pair of characters into a single machine word and then possibly null pad them.</p>
+
+<p>In fact we're going to do the colon (":") step above in phases. First we're going to make everything up to "DAT ENTER" with a word called CREATE. In fact, first we need to know what word we're going to define, so first we get a word from the user using WORD, and then we use CREATE to set the header for that word. Then we'll be adding "DAT ENTER" using two other words, LIT and comma (","), which we're yet to define, in a combination that looks like "LIT ENTER ,". After that we need to set the smudge flag in the word that we're defining, which we do using the two words "LATEST SMUDGE". After that we go into compile mode using right bracket ("]"). That means that colon (":") really looks something like this, if we were able to use it to define itself:</p>
+
+<pre>
+: : WORD CREATE LIT ENTER , LATEST SMUDGE ] ;
+</pre>
+
+<p>Let's define these things!</p>
+
+<p>First we need a subroutine to pack machine-word-sized representations of bytes into two bytes per machine word. This will be used whenever we have input from the user which needs to be translated into something which is compatible with the format in the dictionary.</p>
+
+<p><strong>_PACK</strong>:</p>
+
+<pre id="_PACK">
+:PACK_SUB
+  ; X = INPUT_POSITION
+  ; Y = OUTPUT_POSITION
+  ; A = LENGTH_REMAINING
+:PACK_LOOP
+  SET [Y], [X] ; **OUTPUT_POSITION <- **INPUT_POSITION
+  SHL [Y], 8   ; **OUTPUT_POSITION <<= 8
+  IFE A, 1     ; IF LENGTH_REMAINING == 1
+    SET PC, POP
+  ADD X, 1     ; *INPUT_POSITION++
+  BOR [Y], [X] ; **OUTPUT_POSITION |= **INPUT_POSITION
+  SUB A, 2     ; LENGTH_REMAINING -= 2
+  IFE A, 0     ; IF LENGTH_REMAINING == 0
+    SET PC, POP
+  ADD X, 1     ; *INPUT_POSITION++
+  ADD Y, 1     ; *OUTPUT_POSITION++
+  SET PC, PACK_LOOP
+</pre>
+
+<p>And a test:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+:PADDING DAT 0xFFFF 0xFFFF 0xFFFF 0xFFFF 0xFFFF 0xFFFF
+
+:INPUT_BUFFER DAT 0x0010 0x0020 0x0030 0x0040 0x0050 0 0 0
+:OUTPUT_BUFFER DAT 0 0 0 0 0 0 0 0
+
+.INCLUDE _PACK
+
+:MAIN
+  SET X, INPUT_BUFFER
+  SET Y, OUTPUT_BUFFER
+  SET A, 5
+  JSR PACK_SUB
+:LOOP SET PC, LOOP
+</pre>
+
+<p>Which should give output like this:</p>
+
+<pre>
+0008: 0010 0020 0030 0040 0050 0000 0000 0000 input_buffer
+0010: 1020 3040 5000 0000 0000 0000 0000 0000 output_buffer
+</pre>
+
+<p>Now we can define CREATE. We only call CREATE just after WORD, which means that the stack will be [position length]. We write *DICTIONARY_TOP, the pointer to the most recently defined word in the dictionary, to the current **DICTIONARY_FREE, the next bit of empty memory for us to write a new dictionary entry. Then we write length from the stack, pack the word using our PACK_SUB subroutine, and make sure that we update *DICTIONARY_FREE before returning with a jump to NEXT.</p>
+
+<p><strong>_CREATE</strong>:</p>
+
+<pre id="_CREATE">
+.LINK WORD 0x0004 ; Header with flags and length
+  DAT 0x574F 0x5244 ; "WO" "RD"
+:WORD
+  DAT WORD_XTO
+:WORD_XTO
+  JSR WORD_SUB
+  SET PUSH, WORD_BUFFER
+  SET PUSH, [WORD_LENGTH]
+  SET PC, NEXT
+
+.LINK CREATE 0x0006 ; Header with flags and length
+  DAT 0x4352 0x4541 0x5445 ; "CR" "EA" "TE"
+:CREATE
+  DAT CREATE_XTO
+:CREATE_XTO
+  ; At this point we have just used WORD to read a word from the user
+  ; That means we have WORD_LENGTH and WORD_POSITION on the stack
+  SET A, POP ; WORD_LENGTH
+  SET X, POP ; WORD_BUFFER
+  SET Y, [DICTIONARY_FREE]
+  ; Write the pointer to the previous entry, DICTIONARY_TOP
+  SET [Y], [DICTIONARY_TOP] ; **DICTIONARY_FREE <- *DICTIONARY_TOP
+  ; And update DICTIONARY_TOP to point to the newly created word
+  SET [DICTIONARY_TOP], Y
+  ; Write the length header, without any flags
+  ADD Y, 1
+  SET [Y], A ; Where A = WORD_LENGTH
+  ; Now pack the word input in there
+  ADD Y, 1
+  JSR PACK_SUB
+  ; And update DICTIONARY_FREE!
+  SET [DICTIONARY_FREE], Y
+  ADD [DICTIONARY_FREE], 1
+  SET PC, NEXT
+</pre>
+
+<p>We'll also define a Forth utility word that just loops forever to help us test this code:</p>
+
+<p><strong>_LOOP</strong>:</p>
+
+<pre id="_LOOP">
+.LINK LOOP 0x0004 ; Header with flags and length
+  DAT 0x4C4F 0x4F50 ; "LO" "OP"
+:LOOP
+  DAT LOOP_XTO
+:LOOP_XTO
+  SET PC, LOOP_XTO
+</pre>
+
+<p>And then we can test CREATE:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+
+.INCLUDE _NEXT
+
+:INPUT_STACK ; 32 machine words, 32 characters
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+:INPUT_STACK_BOUNDARY DAT 0x00
+
+.INCLUDE _KEYBOARD
+.INCLUDE _KEY
+.INCLUDE _WORD
+.INCLUDE _PACK
+.INCLUDE _CREATE
+.INCLUDE _LOOP
+.INCLUDE _DICT
+
+:CODE DAT WORD
+      DAT CREATE
+      DAT LOOP
+
+:MAIN JSR CONNECT_KEYBOARD_SUB
+      SET I, CODE
+      SET PC, NEXT
+</pre>
+
+<p>This is testing quite a lot of code, so it's quite interactive. Step through until PC is at KEY_SUB. That's WORD_SUB waiting for character input, so write a letter or two followed by space into the input field. I use "ab " for testing, which will give 0061 0062—the 0020 for space is discarded. Keep stepping through and you can see those characters being written to WORD_BUFFER after the RAM value e07d in the dump. Then CREATE_XTO will be called, and it'll do its thing. Look for the DICTIONARY_FREE area at d1c8, where CREATE_XTO will be writing. It should put in a pointer, then 0002 for the length of the word, and pack the two characters into 6162:</p>
+
+<pre>
+0070: e07d 0061 0062 0000 0000 0000 0000 0000 word_buffer
+...
+d1c8: 01bc 0002 6162 0000 0000 0000 0000 0000
+</pre>
+
+<p>Note that because 0xD1C8 is the initial value of **DICTIONARY_FREE and not DICTIONARY_FREE, we don't get a label for it in the output.</p>
+
+<p>Now let's implement LIT and comma (",").</p>
+
+<p><strong>_LITCOM</strong>:</p>
+
+<pre id="_LITCOM">
+.LINK LIT 0x0003 ; Header with flags and length
+  DAT 0x4C49 0x5400 ; "LI" "T\x00"
+:LIT
+  DAT LIT_XTO
+:LIT_XTO
+  SET PUSH, [I]
+  ADD I, 0x01
+  SET PC, NEXT
+
+.LINK COMMA 0x0001 ; Header with flags and length
+  DAT 0x2C00 ; ",\x00"
+:COMMA
+  DAT COMMA_XTO
+:COMMA_XTO
+  SET X, POP
+  SET Y, [DICTIONARY_FREE]
+  SET [Y], X
+  ADD [DICTIONARY_FREE], 1
+  SET PC, NEXT
+</pre>
+
+<p>It's safe to add 1 to the CODE-R (I) register because there's always going to be an XT after the pseudo-XT after LIT, even if it's just EXIT.</p>
+
+<p>And we'll test:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+
+.INCLUDE _NEXT
+.INCLUDE _LITCOM
+.INCLUDE _LOOP
+.INCLUDE _DICT
+
+:CODE
+  DAT LIT
+  DAT ENTER
+  DAT COMMA
+  DAT LOOP
+
+:MAIN
+  SET I, CODE
+  SET PC, NEXT
+</pre>
+
+<p>When you run this, you should find the pointer to ENTER is added just after the DICTIONARY_FREE pointer. In other words, we just ran the Forth program "LIT ENTER , LOOP". One question is how, when we're reading input from the user, we can use LIT to advance CODE-R (the I register) on to the next piece of code when it hasn't even been read from the user yet. The answer is that LIT is not a word that's used in interpret mode. It's only used in compilation, for example in the definition of colon (":").</p>
+
+<p>Next we can work on LATEST, and SMUDGE. LATEST just puts *DICTIONARY_TOP on the stack. SMUDGE then sets the smudge flag on the entry from the stack.</p>
+
+<p><strong>_LATEST</strong>:</p>
+
+<pre id="_LATEST">
+.LINK LATEST 0x0006 ; Header with flags and length
+  DAT 0x4C41 0x5445 0x5354 ; "LA" "TE" "ST"
+:LATEST
+  DAT LATEST_XTO
+:LATEST_XTO
+  SET PUSH, [DICTIONARY_TOP]
+  SET PC, NEXT
+
+.LINK SMUDGE 0x0006 ; Header with flags and length
+  DAT 0x534D 0x5544 0x4745 ; "SM" "UD" "GE"
+:SMUDGE
+  DAT SMUDGE_XTO
+:SMUDGE_XTO
+  SET X, POP
+  ; Get the flags and length header machine word
+  ; Using XOR makes this a toggle
+  ; We could use BOR to set it outright
+  ADD X, 1        ;         v Smudge flag
+  XOR [X], 0x0200 ; 0b0000001000000000
+  SET PC, NEXT
+</pre>
+
+<p>We can use SMUDGE to smudge itself:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+
+.INCLUDE _NEXT
+.INCLUDE _LOOP
+.INCLUDE _LATEST
+
+.LINK DICTIONARY_TOP
+
+:CODE
+  DAT LATEST
+  DAT SMUDGE
+  DAT LOOP
+
+:MAIN
+  SET I, CODE
+  SET PC, NEXT
+</pre>
+
+<p>The SMUDGE header contains "0006 534d 5544 4745" ("534d 5544 4745" is the packed representation of "SMUDGE"), where 0006 is the flags and length header. The flags and length header gets updated to 0206, which shows that the smudge flag has been set.</p>
+
+<p>The only remaining thing that needs to be implemented to get colon (":") to work is right bracket ("]") for putting us into compile mode. We'll also define left bracket ("[") for putting us into interpret mode.</p>
+
+<p><strong>_BRACKETS</strong>:</p>
+
+<pre id="_BRACKETS">
+:FORTH_MODE DAT 0x00
+
+; Note that this word is flagged as immediate!
+.LINK LBRACKET 0x0101 ; Header with flags and length
+  DAT 0x5B00 ; "[\x00"
+:LBRACKET
+  DAT LBRACKET_XTO
+:LBRACKET_XTO
+  SET [FORTH_MODE], 0x00 ; Interpret
+  SET PC, NEXT
+
+.LINK RBRACKET 0x0001 ; Header with flags and length
+  DAT 0x5D00 ; "]\x00"
+:RBRACKET
+  DAT RBRACKET_XTO
+:RBRACKET_XTO
+  SET [FORTH_MODE], 0x01 ; Compile
+  SET PC, NEXT
+</pre>
+
+<p>And now we can define colon (":") very easily!</p>
+
+<p><strong>_COLON</strong>:</p>
+
+<pre id="_COLON">
+.LINK COLON 0x0001 ; Header with flags and length
+  DAT 0x3A00 ; ":\x00"
+:COLON
+  DAT ENTER
+  DAT WORD
+  DAT CREATE
+  DAT LIT
+  DAT ENTER
+  DAT COMMA
+  DAT LATEST
+  DAT SMUDGE
+  DAT RBRACKET
+  DAT EXIT
+</pre>
+
+<p>Semicolon (";") is not much more difficult:</p>
+
+<p><strong>_SEMICOLON</strong>:</p>
+
+<pre id="_SEMICOLON">
+; Note that this word is flagged as immediate!
+; This isn't needed yet; it's used by the REPL
+.LINK SEMICOLON 0x0101 ; Header with flags and length
+  DAT 0x3B00 ; ";\x00"
+:SEMICOLON
+  DAT ENTER
+  DAT LIT
+  DAT EXIT
+  DAT COMMA
+  DAT LATEST
+  DAT SMUDGE ; This is a toggle, so we unsmudge here
+  DAT LBRACKET
+  DAT EXIT
+</pre>
+
+<p>You may have noticed that both left bracket ("[") and semicolon (";") are flagged as immediate words. That means that when we're compiling, we won't just add these words to the current definition. Instead, we'll execute them, because we want to be able to end our definition somehow. We'll be entering semicolon (";") first but we'll still be in compile mode; the immediate flag takes us in there anyway. Then when semicolon (";") is done, we'll end with left bracket (";") which again we enter even though we're in compile mode because it has the immediate flag, and then that takes us out of compile mode and back into interpret mode.</p>
+
+<p>We'll also create a little compile suite from these:</p>
+
+<p><strong>_COMPILE</strong>:</p>
+
+<pre id="_COMPILE">
+.INCLUDE _CREATE
+.INCLUDE _LITCOM
+.INCLUDE _LATEST
+.INCLUDE _BRACKETS
+.INCLUDE _COLON
+.INCLUDE _SEMICOLON
+</pre>
+
+<h3>Testing word creation</h3>
+
+<p>This code would be difficult to test because it wants to use WORD to get the next word to define, and we don't have a REPL or outer interpreter set up yet. We could make one, but we want to test this bit of code as a unit test before doing that. So instead, we can monkey patch colon (":") to use a replacement for WORD which we'll call AUTOWORD:</p>
+
+<pre class="assembly">
+:START SET PC, MAIN
+
+.INCLUDE _NEXT
+.INCLUDE _WORDBUF
+.INCLUDE _LOOP
+.INCLUDE _PACK
+.INCLUDE _COMPILE
+
+:WORD_SUB DAT 0x00
+
+.LINK AUTOWORD 0x0008 ; Header with flags and length
+  DAT 0x4155 0x544F 0x574F 0x5244 ; "AU" "TO" "WO" "RD"
+:AUTOWORD
+  DAT AUTOWORD_XTO
+:AUTOWORD_XTO
+  SET X, WORD_BUFFER
+  SET [X], 0x0045
+  SET [X+1], 0x0058
+  SET [X+2], 0x0041
+  SET [X+3], 0x004D
+  SET [X+4], 0x0050
+  SET [X+5], 0x004C
+  SET [X+6], 0x0045
+  SET [WORD_LENGTH], 0x07
+  SET PUSH, WORD_BUFFER
+  SET PUSH, [WORD_LENGTH]
+  SET PC, NEXT
+
+.INCLUDE _DICT
+
+:CODE
+  DAT COLON
+  DAT SEMICOLON
+  DAT LOOP
+
+:MAIN
+  SET I, CODE
+:MONKEY_PATCH
+  SET X, COLON
+  SET [X+1], AUTOWORD
+  SET PC, NEXT
+</pre>
+
+<p>This will create an empty word, because it's the equivalent of doing ": AUTOWORD ;" which has nothing in it (apart from its two XTs ENTER and EXIT). In other words, it's NOOP.</p>
+
+<h2>Output</h2>
+
+<p>Before we can write a REPL, we need some way of displaying output. In an <a href="https://i.imgur.com/XIXc4.jpg">early assembler test</a>, there was a console for the DCPU-16 which was memory mapped from 0x8000 to 0x8180. It seems that this early experiment was never standardised, though it did appear in an earlier version of Mappum DCPU-16, because it was later replaced by the much more complicated LEM1802, a low energy monitor manufactured by Nya Elektriska. Thankfully, Mappum DCPU-16 has an emulator for that, but we need to write a driver for it.</p>
+
+<p><strong>_LEM</strong>:</p>
+
+<pre id="_LEM">
+:LEM1802 DAT 0x7349 0xF615
+:SCREEN_CURSOR DAT 0x8000
+
+:CONNECT_LEM1802_SUB
+  ; Memory map the screen to 0x8000
+  ; The top of the screen memory will be 0x8182
+  SET A, 0
+  SET B, 0x8000
+  HWI [LEM1802]
+  ; Set the border colour
+  SET A, 3
+  SET B, 8
+  HWI [LEM1802]
+  SET PC, POP
+
+:OUTPUT_CHAR_SUB
+  ; Input is a char on X
+  BOR X, 0xF000 ; White on black
+  SET Y, [SCREEN_CURSOR]
+  SET [Y], X
+  ADD [SCREEN_CURSOR], 1
+  IFG [SCREEN_CURSOR], 0x8182
+    ; Should set it all to 0 again
+    SET [SCREEN_CURSOR], 0x8000
+  SET PC, POP
+</pre>
+
+<p>And a test:</p>
+
+<pre class="assembly output">
+:START SET PC, MAIN
+
+.INCLUDE _LEM
+
+:MAIN
+  JSR CONNECT_LEM1802_SUB
+  ; Set first character to "a"
+  SET [0x8000], 0xF061
+  SET X, 0x65
+  JSR OUTPUT_CHAR_SUB
+  SET X, 0x78
+  JSR OUTPUT_CHAR_SUB
+  SET X, 0x61
+  JSR OUTPUT_CHAR_SUB
+  SET X, 0x6D
+  JSR OUTPUT_CHAR_SUB
+  SET X, 0x70
+  JSR OUTPUT_CHAR_SUB
+  SET X, 0x6C
+  JSR OUTPUT_CHAR_SUB
+  SET X, 0x65
+  JSR OUTPUT_CHAR_SUB
+:LOOP SET PC, LOOP
+</pre>
+
+<p>In this test you might have noticed a new addition to the user interface.</p>
+
+<h2>The REPL</h2>
+
+<p>We have almost enough code now to implement the Forth REPL. The REPL takes in words from the user, and decides what to do with them depending on the value of FORTH_MODE. We're either interpreting, which means that we run whatever words the user enters, or compiling, which means that we're defining new words.</p>
+
+<p>Since the REPL is interactive, we also want it to show us what we're typing. The best layer to add this to is the handler used by WORD to get a character from the keyboard, since WORD is what the REPL uses to read (the "R" in REPL). We'll define a version of KEY_SUB, the handler, which calls OUTPUT_CHAR_SUB.</p>
+
+<p><strong>_KEYS</strong>:</p>
+
+<pre id="_KEYS">
+:KEY_STORAGE DAT 0x00
+
+:KEY_SUB
+  ; Waits for a character and pushes it onto X
+  ; Factored out because it's useful to call
+  ; If we don't have a character yet...
+  IFE [INPUT_STACK_START], [INPUT_STACK_END]
+    ; Then we loop until we get one
+    SET PC, KEY_SUB
+  ; We're out of the loop so we must have a character now
+  ; We get the character and place it into X using INPUT_POP_SUB
+  JSR INPUT_POP_SUB
+  SET [KEY_STORAGE], X
+  ; With the character on X, we can now output it to the LEM
+  JSR OUTPUT_CHAR_SUB
+  SET X, [KEY_STORAGE]
+  ; Return from subroutine
+  SET PC, POP
+</pre>
+
+<p>Now we can define the REPL itself. It's actually written in two parts, REP and REDO, where REDO is the loop (the "L" in REPL). If you're tempted to rename REDO to L, remember that you can edit all of the executable code in this page straight in your browser, but make sure that you update the header content as well as the labels. We put REP and REDO together to form the main REPL word, which also acts as our entry point when we start Forth running.</p>
+
+<p><strong>_REPL</strong>:</p>
+
+<pre id="_REPL">
+:REP_PACK_BUFFER
+  DAT 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+; Read, Evaluate, and Print, but don't Loop here
+.LINK REP 0x0003 ; Header with flags and length
+  DAT 0x5245 0x5000 ; "RE" "P\x00"
+:REP
+  DAT REP_XTO
+:REP_XTO
+  ; Get a word from the user
+  JSR WORD_SUB
+  ; Check whether the word is in the dictionary
+  ; Find expects a packed word
+  SET A, [WORD_LENGTH]
+  SET X, WORD_BUFFER
+  SET Y, REP_PACK_BUFFER
+  JSR PACK_SUB
+  ; Now set the arguments for FIND_SUB appropriately
+  SET X, REP_PACK_BUFFER
+  SET Y, [WORD_LENGTH]
+  JSR FIND_SUB
+  ; Test whether the word was in the dictionary
+  IFE X, 0x0000
+    ; The word was not found, print an error ("!! ")
+    SET PC, REP_PRINT_ERROR
+
+  ; Check whether the word is immediate
+  SET A, [X+1]
+  AND A, 0x0100 ; 0b0000000100000000
+  IFE A, 0x0100
+    ; Okay, we have an immediate
+    SET J, Y
+  IFE A, 0x0100
+    SET PC, [Y]
+
+  ; Are we interpreting?
+  IFE [FORTH_MODE], 0
+    ; Then jump straight to the word, no need to use NEXT
+    ; It's like the next word is an extension of REP
+    ; We do, however, need to set J in case it's a normal word
+    SET J, Y
+  IFE [FORTH_MODE], 0
+    SET PC, [Y]
+  ; Otherwise, we're compiling
+  SET PUSH, Y
+  SET PC, COMMA_XTO
+
+:REP_PRINT_ERROR
+  SET X, 0x21
+  JSR OUTPUT_CHAR_SUB
+  JSR OUTPUT_CHAR_SUB
+  SET X, 0x20
+  JSR OUTPUT_CHAR_SUB
+  SET PC, REP_XTO
+
+.LINK REDO 0x0004 ; Header with flags and length
+  DAT 0x5245 0x444F ; "RE" "DO"
+:REDO
+  DAT REDO_XTO
+:REDO_XTO
+  SUB I, 2
+  SET PC, NEXT
+
+; Use REP and REDO to create the REPL
+.LINK REPL 0x0004 ; Header with flags and length
+  DAT 0x5245 0x504C ; "RE" "PL"
+:REPL
+  DAT ENTER REP REDO 1 ; No need for EXIT! Do need the 1 though
+</pre>
+
+<p>Now we can test it. As well as DOUBLE, DUP, ADD, and all of the compile words, we also define ONE to push 0x01 onto the stack, and UNARY-SIZE to print the current size of the stack in unary. These are just simple words for testing.</p>
+
+<p><strong>_UNARY</strong>:</p>
+
+<pre id="_UNARY">
+.LINK ONE 0x0003 ; Header with flags and length
+  DAT 0x4F4E 0x4500 ; "ON" "E\x00"
+:ONE
+  DAT ONE_XTO
+:ONE_XTO
+  SET PUSH, 0x01
+  SET PC, NEXT
+
+.LINK UNARY_SIZE 0x000A ; Header with flags and length
+  DAT 0x554E 0x4152 0x592D 0x5349 0x5A45 ; "UN" "AR" "Y-" "SI" "ZE"
+:UNARY_SIZE
+  DAT UNARY_SIZE_XTO
+:UNARY_SIZE_XTO
+  IFE SP, 0
+    SET PC, NEXT
+  ; We use A because OUTPUT_CHAR_SUB writes to X and Y
+  SET A, 0xFFFF
+  SUB A, SP
+  ADD A, 1
+:UNARY_SIZE_LOOP
+  SET X, 0x2E
+  IFG A, 0
+    JSR OUTPUT_CHAR_SUB
+  SET X, 0x20
+  IFE A, 0
+    JSR OUTPUT_CHAR_SUB
+  IFE A, 0
+    SET PC, NEXT
+  SUB A, 1
+  SET PC, UNARY_SIZE_LOOP
+</pre>
+
+<p>And we can just .INCLUDE almost everything to make a working Forth system:</p>
+
+<pre class="assembly output">
+:START SET PC, MAIN
+
+.INCLUDE _NEXT
+.INCLUDE _DDA
+.INCLUDE _FIND
+.INCLUDE _INPUT
+.INCLUDE _KEYS
+.INCLUDE _WORD
+.INCLUDE _COMPILE
+.INCLUDE _LEM
+.INCLUDE _PACK
+.INCLUDE _REPL
+.INCLUDE _UNARY
+.INCLUDE _DICT
+
+:CODE DAT REPL
+
+:MAIN
+  SET I, CODE
+  JSR CONNECT_KEYBOARD_SUB
+  JSR CONNECT_LEM1802_SUB
+  SET PC, NEXT
+</pre>
+
+<p>It uses just over 2 KB of memory, up to 0x0408. Try typing in fun things like ": DD DUP DUP ; ONE DD UNARY-SIZE ... NOOP !! " or ": DD DUP DUP ; ONE UNARY-SIZE . DD DD DD INA !! UNARY-SIZE .......".</p>
+
+<h2>Design choices</h2>
+
+<h3>Low-level</h3>
+
+<p>This guide is heavily indebted to <a href="https://raw.githubusercontent.com/AlexandreAbreu/jonesforth/master/jonesforth.S">JONESFORTH</a> by Richard W.M. Jones, but makes a number of different design decisions. At the top level, the two biggest changes are that Moonforth runs on the bare metal, whereas JONESFORTH runs on top of Linux. We had to write our own device drivers. On the other hand, we also leave many complicating details out such as >CFA, which is folded into FIND, and numeric literals.</p>
+
+<h3>Indirect threading</h3>
+
+<p>There are different kinds of threaded code, and each Forth implementation has to pick one. The five main kinds are called direct, indirect, token, cons, and subroutine (or call). The differences between them generally come down to the choice of when to do a call and when to embed a pointer instead. The fastest of the five main kinds is often subroutine threading, depending on the specific architecture, but it also has the most introspectability problems. Most classic Forth implementations are either direct (DTC) or indirect (ITC) threaded. Some, like gforth, even pick a hybrid of the two. There are good arguments for indirect threading over direct:</p>
+
+<blockquote>
+<p>DTC can significantly improve performance, but DTC lacks the flexibility of ITC. ITC allows all defined words to be revectored to new definitions. A new definition can supplant an older definition. Or, a new definition become an extension as it can execute the older definition in addition to itself. Revectoring an old definition affects all words which include it in their definitions.</p>
+<p><cite><a href="http://www.jimbrooks.org/programming/forth/forthInternals.php">Jim Brooks</a></cite></p>
+</blockquote>
+
+<p>And similarly:</p>
+
+<blockquote>
+<p>ITC does have the advantage that the execution engine can be modified by changing the look up table without modifying all the generated code. This would make it possible to switch between normal execution, profile gathering execution or debug execution modes by simply overwriting the lookup table.</p>
+<p><cite><a href="http://realityforge.org/code/virtual-machines/2011/05/19/interpreters.html">Peter Donald</a></cite></p>
+</blockquote>
+
+<p>On the other hand, two Forth giants dissent:</p>
+
+<blockquote>
+<p>Guy Kelly has compiled a superb review of Forth implementations for the IBM PC [KEL92], which I strongly recommend to all Forth kernel writers. Of the 19 Forths he studied, 10 used DTC, 7 used ITC, and 2 used subroutine threading (discussed next). I recommend the use of Direct-Threaded Code over Indirect-Threaded Code for all new Forth kernels.</p>
+<p><cite><a href="http://www.bradrodriguez.com/papers/moving1.htm">Brad Rodriguez</a></cite></p>
+</blockquote>
+
+<p>And more recently:</p>
+
+<blockquote>
+<p>Direct Thread Model is the shortest, fastest, and cleanest.</p>
+<p><cite><a href="http://www.forth.org/svfig/kk/11-2014-Ting.pdf">Chen-Hanson Ting</a>, p.8</cite></p>
+</blockquote>
+
+<p>Though Rodriguez and Ting both seem to favour DTC for its simplicity, the performance aspect is really down to architecture. Since ITC is so powerful, and since Chuck Moore invented ITC as well as Forth and considered Forth to be completed once he had discovered ITC, we used ITC.</p>
+
+<h2>Notes</h2>
+
+<p>Moonforth is not to be confused with <a href="http://losinggeneration.com/2014/01/11/boostrapping-a-forth-in-46-lines-of-moonscript-code/">Miniforth MoonScript</a> by Harley Laue.</p>
+
+<hr>
+
+<p>FORTH ♡ IF HONK THEN</p>
